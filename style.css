@@ -124,3 +124,11 @@ canvas#game {
 @media (min-width: 700px) {
   #controls { opacity: 0.55; }
 }
+
+#disclaimer {
+  margin: 4px 4px 0;
+  color: #888;
+  font-size: 9px;
+  line-height: 1.4;
+  text-align: center;
+}

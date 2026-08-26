@@ -68,3 +68,7 @@ Live at **https://sheery96.github.io/claude-ai-games/** via GitHub Pages (served
 ## License
 
 MIT — see [LICENSE](LICENSE). Free to use, modify, and share.
+
+## Disclaimer
+
+This is an unofficial fan project inspired by classic 2000s mobile Snake games. It is not affiliated with, endorsed by, or sponsored by Nokia. All code, art, and assets in this repo are original. "Nokia" and any related marks belong to their respective owners.
