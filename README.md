@@ -6,7 +6,7 @@ A tiny, dependency-free Snake game inspired by the classic Nokia 3310, built to 
 ![size](https://img.shields.io/badge/dependencies-zero-0f380f)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-### ▶ [Play it now](https://sheery96.github.io/claude-ai/) — no install required
+### ▶ [Play it now](https://sheery96.github.io/claude-ai-games/) — no install required
 
 Open that link on desktop or mobile. On your phone, use "Add to Home Screen" (see below) to install it like a native app.
 
@@ -23,7 +23,7 @@ Instead of Flutter/React Native/native builds, this is plain **HTML + CSS + Java
 
 ### Desktop / any browser
 ```bash
-cd claude-ai
+cd claude-ai-games
 python3 -m http.server 8000
 ```
 Then open `http://localhost:8000` in your browser.
@@ -52,7 +52,7 @@ Wall or self-collision ends the run, just like the original — tap/press any ke
 ## Project structure
 
 ```
-claude-ai/
+claude-ai-games/
 ├── index.html          # markup + retro "phone" chrome
 ├── style.css            # Nokia LCD look (pixelated canvas, D-pad)
 ├── game.js               # game loop, input, collision, scoring
@@ -63,7 +63,7 @@ claude-ai/
 
 ## Deploying
 
-Live at **https://sheery96.github.io/claude-ai/** via GitHub Pages (served from the `main` branch root). Any static host works, though — no server-side code required.
+Live at **https://sheery96.github.io/claude-ai-games/** via GitHub Pages (served from the `main` branch root). Any static host works, though — no server-side code required.
 
 ## License
 
