@@ -4,6 +4,11 @@ A tiny, dependency-free Snake game inspired by the classic Nokia 3310, built to 
 
 ![platform](https://img.shields.io/badge/platform-web%20%7C%20android%20%7C%20ios-9bbc0f)
 ![size](https://img.shields.io/badge/dependencies-zero-0f380f)
+![license](https://img.shields.io/badge/license-MIT-blue)
+
+### ▶ [Play it now](https://sheery96.github.io/claude-ai/) — no install required
+
+Open that link on desktop or mobile. On your phone, use "Add to Home Screen" (see below) to install it like a native app.
 
 ## Why it's lightweight
 
@@ -58,15 +63,8 @@ claude-ai/
 
 ## Deploying
 
-Any static host works — no server-side code required. For example, with GitHub Pages:
-
-```bash
-# from the repo root, on the default branch
-# Settings → Pages → Deploy from branch → main → /
-```
-
-Once deployed, the HTTPS URL is installable on both Android and iOS as described above.
+Live at **https://sheery96.github.io/claude-ai/** via GitHub Pages (served from the `main` branch root). Any static host works, though — no server-side code required.
 
 ## License
 
-This project is currently unlicensed. All rights reserved unless otherwise noted.
+MIT — see [LICENSE](LICENSE). Free to use, modify, and share.
