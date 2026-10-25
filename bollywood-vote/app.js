@@ -1,13 +1,20 @@
 /* Bollywood Night Awards — party voting app.
- * No build step, no server of our own. Guests on their own phones talk to the
- * host's screen peer-to-peer (WebRTC via the free PeerJS broker). A
- * pass-the-phone mode works fully offline on one device.
+ *
+ * No build step and no server of our own. Votes travel through ntfy.sh, a free
+ * public relay: guests post their ballot to a topic named after the party
+ * code, and the host's screen reads it back. The relay keeps messages for 12
+ * hours, so votes are never lost if the host's phone locks or loses signal —
+ * the host catches up the moment the app is open again.
+ *
+ * A pass-the-phone mode works fully offline on one device.
  */
 'use strict';
 
-const PEER_PREFIX = 'bwnight-awards-';
+const RELAY = String(window.BWV_RELAY || 'https://ntfy.sh').replace(/\/+$/, '');
+const TOPIC_PREFIX = 'bollywood-night-awards-v2-';
+const MAX_MESSAGE_BYTES = 3800;   // ntfy turns bodies over 4 KB into attachments
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-const HOST_KEY = 'bwv-host-v1';
+const HOST_KEY = 'bwv-host-v2';
 const VOTER_KEY = 'bwv-voter-id';
 const BALLOT_KEY = 'bwv-ballot-';
 
@@ -56,13 +63,9 @@ function randomCode(len = 5) {
   return Array.from(buf, (n) => CODE_CHARS[n % CODE_CHARS.length]).join('');
 }
 
-function randomId() {
-  return (crypto.randomUUID ? crypto.randomUUID() : randomCode(16));
-}
-
 function voterId() {
   let id = store.get(VOTER_KEY);
-  if (!id) { id = randomId(); store.set(VOTER_KEY, id); }
+  if (!id) { id = randomCode(16); store.set(VOTER_KEY, id); }
   return id;
 }
 
@@ -80,23 +83,89 @@ function toast(msg) {
   const t = h('div', { class: 'toast', role: 'status' }, msg);
   document.body.append(t);
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.remove(), 2400);
+  toastTimer = setTimeout(() => t.remove(), 3200);
 }
 
 function render(...nodes) {
-  const app = $('#app');
-  app.replaceChildren(...nodes);
+  $('#app').replaceChildren(...nodes);
   window.scrollTo({ top: 0 });
+}
+
+/* ---------- relay (ntfy.sh) ---------- */
+
+class RelayError extends Error {
+  constructor(kind) {
+    super({
+      offline: 'No internet connection. Check your signal and try again.',
+      busy: 'Too many votes from this Wi-Fi at once. Wait 30 seconds and try again.',
+      'too-big': 'That’s too much to send. Shorten the guest list or the award names.',
+      server: 'The voting service didn’t respond. Try again in a moment.',
+    }[kind] || 'Something went wrong. Try again.');
+    this.kind = kind;
+  }
+}
+
+function topicUrl(code) {
+  return `${RELAY}/${TOPIC_PREFIX}${code.toLowerCase()}`;
+}
+
+function bytes(str) { return new TextEncoder().encode(str).length; }
+
+async function relayPost(code, payload, onWait) {
+  const body = JSON.stringify(payload);
+  if (bytes(body) > MAX_MESSAGE_BYTES) throw new RelayError('too-big');
+  const res = await relayFetch(topicUrl(code), { method: 'POST', body, cache: 'no-store' }, onWait);
+  try { return await res.json(); } catch { return {}; }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The relay allows each network a burst of requests, then one more every
+// ten seconds. When a whole party votes at once on the same Wi-Fi, keep
+// waiting for the allowance to refill (up to four minutes) instead of failing.
+async function relayFetch(url, opts, onWait) {
+  const giveUpAt = Date.now() + 4 * 60 * 1000;
+  for (;;) {
+    let res;
+    try { res = await fetch(url, opts); } catch { throw new RelayError('offline'); }
+    if (res.status === 429 && Date.now() < giveUpAt) {
+      if (onWait) onWait();
+      await sleep(10500 + Math.random() * 4000);
+      continue;
+    }
+    if (res.status === 429) throw new RelayError('busy');
+    if (!res.ok) throw new RelayError('server');
+    return res;
+  }
+}
+
+// One relay line -> { id, time, data } for our own messages, else null.
+function parseRelayLine(line) {
+  if (!line || !line.trim()) return null;
+  let m;
+  try { m = JSON.parse(line); } catch { return null; }
+  if (!m || m.event !== 'message' || typeof m.message !== 'string') return null;
+  let data;
+  try { data = JSON.parse(m.message); } catch { return null; }
+  if (!data || typeof data !== 'object' || typeof data.t !== 'string') return null;
+  return { id: m.id, time: Number(m.time) || 0, data };
+}
+
+async function relayPoll(code, since = 'all', onWait) {
+  const res = await relayFetch(`${topicUrl(code)}/json?poll=1&since=${encodeURIComponent(since)}`, { cache: 'no-store' }, onWait);
+  const text = await res.text();
+  return text.split('\n').map(parseRelayLine).filter(Boolean);
 }
 
 /* ---------- party data ---------- */
 
 function sanitizeParty(p) {
-  const nominees = [...new Set((p.nominees || []).map((n) => clean(n, 32)).filter(Boolean))].slice(0, 60);
+  p = p || {};
+  const nominees = [...new Set((p.nominees || []).map((n) => clean(n, 32)).filter(Boolean))].slice(0, 50);
   const categories = (p.categories || [])
-    .map((c, i) => ({ id: clean(c.id, 20) || `c${i}`, title: clean(c.title, 60), hint: clean(c.hint, 120) }))
+    .map((c, i) => ({ id: clean(c.id, 8) || `c${i}`, title: clean(c.title, 60), hint: clean(c.hint, 100) }))
     .filter((c) => c.title)
-    .slice(0, 20);
+    .slice(0, 12);
   return { name: clean(p.name, 60) || 'Bollywood Night', nominees, categories };
 }
 
@@ -124,12 +193,15 @@ function tally(party, ballots) {
   });
 }
 
-/* ---------- host state ---------- */
+/* ---------- host state & sync ---------- */
 
-let host = null;       // persisted host state
-let hostPeer = null;
-const hostConns = new Set();
+let host = null;          // persisted host state
 let hostStatus = 'connecting';
+let hostStatusMsg = '';
+let hostSource = null;    // EventSource for live updates
+let hostRetryTimer = null;
+let hostRetries = 0;
+let hostSyncing = false;
 let wakeLock = null;
 
 function saveHost() { if (host) store.set(HOST_KEY, host); }
@@ -139,101 +211,94 @@ function newHost(party, mode) {
     code: randomCode(),
     mode,                 // 'phones' | 'pass'
     party: sanitizeParty(party),
-    ballots: {},          // voterId -> { name, votes, at }
+    ballots: {},          // voterId -> { name, votes, time }
     open: true,
+    closedAt: null,       // relay time (seconds) voting closed; later ballots are ignored
+    lastId: null,         // last relay message seen
+    published: 0,         // when the party details were last posted (ms)
     reveal: { index: 0, opened: false },
     phase: 'voting',      // 'voting' | 'reveal'
   };
   saveHost();
 }
 
-function recordBallot(id, name, votes) {
-  const clean_votes = sanitizeVotes(host.party, votes);
-  if (!Object.keys(clean_votes).length) return false;
-  host.ballots[id] = { name: clean(name, 32) || 'Guest', votes: clean_votes, at: Date.now() };
+function nowSec() { return Math.floor(Date.now() / 1000); }
+
+function recordBallot(id, name, votes, time = nowSec()) {
+  const picked = sanitizeVotes(host.party, votes);
+  if (!Object.keys(picked).length) return false;
+  const prev = host.ballots[id];
+  if (prev && prev.time > time) return false;   // keep the newest ballot per voter
+  host.ballots[id] = { name: clean(name, 32) || 'Guest', votes: picked, time };
   saveHost();
   return true;
 }
 
-function partyPayload(forVoter) {
-  return {
-    t: 'party',
-    party: host.party,
-    open: host.open,
-    mine: forVoter && host.ballots[forVoter] ? host.ballots[forVoter] : null,
-  };
+function setHostStatus(status, msg = '') {
+  hostStatus = status;
+  hostStatusMsg = msg;
+  const el = $('#host-status');
+  if (el) el.replaceWith(statusLine());
 }
 
-function broadcast(msg) {
-  for (const c of hostConns) { try { c.send(msg); } catch { /* dropped */ } }
-}
-
-function startHostPeer(attempt = 0) {
-  if (typeof Peer === 'undefined') {
-    hostStatus = 'down';
-    refreshHostStatus('Couldn’t load the connection library. Check your internet and reload.');
-    return;
+function handleHostMessage(m) {
+  if (!host) return;
+  host.lastId = m.id;
+  const d = m.data;
+  if (d.t === 'ballot') {
+    if (host.closedAt && m.time > host.closedAt) { saveHost(); return; }
+    const id = clean(d.voter, 40);
+    if (id && recordBallot(id, d.name, d.votes, m.time)) refreshHostLobby();
   }
-  if (hostPeer && !hostPeer.destroyed) return;
-  hostStatus = 'connecting';
-  refreshHostStatus();
-  const peer = new Peer(PEER_PREFIX + host.code.toLowerCase());
-  hostPeer = peer;
-
-  peer.on('open', () => { hostStatus = 'live'; refreshHostStatus(); });
-
-  peer.on('connection', (conn) => {
-    hostConns.add(conn);
-    let connVoter = null;
-    conn.on('data', (msg) => {
-      if (!msg || typeof msg !== 'object' || !host) return;
-      if (msg.t === 'hello') {
-        connVoter = clean(msg.voterId, 64);
-        conn.send(partyPayload(connVoter));
-      } else if (msg.t === 'ballot') {
-        connVoter = clean(msg.voterId, 64) || connVoter;
-        if (!host.open) { conn.send({ t: 'closed' }); return; }
-        const ok = connVoter && recordBallot(connVoter, msg.name, msg.votes);
-        conn.send(ok ? { t: 'ack' } : { t: 'reject', reason: 'Pick at least one nominee before sending.' });
-        if (ok) refreshHostLobby();
-      }
-    });
-    conn.on('close', () => hostConns.delete(conn));
-    conn.on('error', () => hostConns.delete(conn));
-  });
-
-  peer.on('disconnected', () => {
-    hostStatus = 'connecting';
-    refreshHostStatus();
-    setTimeout(() => { if (!peer.destroyed) peer.reconnect(); }, 1500);
-  });
-
-  peer.on('error', (err) => {
-    if (err.type === 'unavailable-id' && attempt < 8) {
-      // After a reload the broker may still hold our old id for a few seconds.
-      peer.destroy();
-      hostPeer = null;
-      setTimeout(() => startHostPeer(attempt + 1), 3000);
-      return;
-    }
-    if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
-      hostStatus = 'down';
-      refreshHostStatus('Lost the connection. Retrying…');
-      peer.destroy();
-      hostPeer = null;
-      setTimeout(() => startHostPeer(attempt + 1), 4000);
-      return;
-    }
-    if (err.type === 'peer-unavailable') return; // irrelevant on host
-    console.warn('Peer error', err);
-  });
+  saveHost();
 }
 
-function stopHostPeer() {
-  for (const c of hostConns) { try { c.close(); } catch { /* ignore */ } }
-  hostConns.clear();
-  if (hostPeer) { try { hostPeer.destroy(); } catch { /* ignore */ } }
-  hostPeer = null;
+function stopHostSync() {
+  clearTimeout(hostRetryTimer);
+  hostRetryTimer = null;
+  if (hostSource) { hostSource.close(); hostSource = null; }
+}
+
+function scheduleHostSync() {
+  stopHostSync();
+  const delay = Math.min(30000, 2000 * 2 ** hostRetries);
+  hostRetries++;
+  hostRetryTimer = setTimeout(hostSync, delay);
+}
+
+async function publishParty() {
+  await relayPost(host.code, { t: 'party', party: host.party, open: host.open });
+  host.published = Date.now();
+  saveHost();
+}
+
+async function hostSync() {
+  if (!host || host.mode !== 'phones' || hostSyncing) return;
+  hostSyncing = true;
+  stopHostSync();
+  setHostStatus('connecting');
+  try {
+    // Re-post the party details before the relay's 12-hour cache drops them.
+    if (host.phase === 'voting' && Date.now() - (host.published || 0) > 10 * 3600e3) await publishParty();
+    // Catch up on everything sent while this screen was closed or asleep…
+    const missed = await relayPoll(host.code, host.lastId || 'all');
+    missed.forEach(handleHostMessage);
+    // …then listen live.
+    const src = new EventSource(`${topicUrl(host.code)}/sse?since=${encodeURIComponent(host.lastId || 'all')}`);
+    hostSource = src;
+    src.onopen = () => { hostRetries = 0; setHostStatus('live'); };
+    src.onmessage = (e) => { const m = parseRelayLine(e.data); if (m) handleHostMessage(m); };
+    src.onerror = () => {
+      if (hostSource !== src) return;
+      setHostStatus('connecting', 'Reconnecting…');
+      scheduleHostSync();
+    };
+  } catch (err) {
+    setHostStatus('down', `${err.message} Retrying automatically.`);
+    scheduleHostSync();
+  } finally {
+    hostSyncing = false;
+  }
 }
 
 async function keepAwake() {
@@ -247,11 +312,14 @@ async function keepAwake() {
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || !host) return;
-  if (host.mode === 'phones') {
-    if (!hostPeer || hostPeer.destroyed) startHostPeer();
-    else if (hostPeer.disconnected) hostPeer.reconnect();
+  if (host.mode === 'phones' && host.phase === 'voting' && hostStatus !== 'live') {
+    hostRetries = 0;
+    hostSync();
   }
   if (host.phase === 'voting') keepAwake();
+});
+window.addEventListener('online', () => {
+  if (host && host.mode === 'phones' && host.phase === 'voting' && hostStatus !== 'live') { hostRetries = 0; hostSync(); }
 });
 
 /* ---------- views: home ---------- */
@@ -299,7 +367,7 @@ function viewSetup() {
   let nameIn, nomineesIn;
   const catsWrap = h('div', { class: 'stack' });
   const err = h('p', { class: 'error', role: 'alert' });
-  let cats = (saved ? saved.party.categories : DEFAULT_CATEGORIES).map((c) => ({ ...c }));
+  const cats = (saved ? saved.party.categories : DEFAULT_CATEGORIES).map((c) => ({ ...c }));
 
   const drawCats = () => {
     catsWrap.replaceChildren(...cats.map((c, i) =>
@@ -308,28 +376,40 @@ function viewSetup() {
           oninput: (e) => { c.title = e.target.value; } }),
         h('button', { type: 'button', class: 'icon-btn', 'aria-label': `Remove ${c.title || 'award'}`,
           onclick: () => { cats.splice(i, 1); drawCats(); } }, '×'))),
-    h('button', { type: 'button', class: 'btn ghost', onclick: () => {
+    cats.length < 12 ? h('button', { type: 'button', class: 'btn ghost', onclick: () => {
       cats.push({ title: '', hint: '' }); drawCats();
       const inputs = catsWrap.querySelectorAll('input'); inputs[inputs.length - 1].focus();
-    } }, 'Add an award'));
+    } }, 'Add an award') : null);
   };
   drawCats();
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const nominees = nomineesIn.value.split(/[\n,]/);
     const party = sanitizeParty({
       name: nameIn.value,
-      nominees,
+      nominees: nomineesIn.value.split(/[\n,]/),
       categories: cats.map((c, i) => ({ id: `c${i}`, title: c.title, hint: c.hint })),
     });
     if (party.nominees.length < 2) { err.textContent = 'Add at least two guests as nominees, one per line.'; return; }
     if (!party.categories.length) { err.textContent = 'Add at least one award.'; return; }
+    if (bytes(JSON.stringify({ t: 'party', party, open: true })) > MAX_MESSAGE_BYTES) {
+      err.textContent = 'That’s too much to send. Shorten the guest list or the award names.';
+      return;
+    }
     if (saved && Object.keys(saved.ballots).length &&
         !confirm('Starting a new party clears the votes from your last one. Continue?')) return;
-    stopHostPeer();
+    stopHostSync();
     newHost(party, fd.get('mode'));
+    const btn = e.submitter;
+    if (host.mode === 'phones') {
+      if (btn) { btn.disabled = true; btn.textContent = 'Opening voting…'; }
+      try { await publishParty(); }
+      catch (error) {
+        // Keep going: the lobby shows the problem and keeps retrying.
+        setHostStatus('down', `${error.message} Retrying automatically.`);
+      }
+    }
     resumeHost();
   };
 
@@ -353,7 +433,7 @@ function viewSetup() {
         h('label', null,
           h('input', { type: 'radio', name: 'mode', value: 'phones', checked: true }),
           h('span', null, h('strong', null, 'On their own phones'),
-            h('span', { class: 'muted small' }, 'Guests scan a QR code on your screen. Keep your screen open while they vote.'))),
+            h('span', { class: 'muted small' }, 'Guests scan a QR code on your screen. Needs an internet connection.'))),
         h('label', null,
           h('input', { type: 'radio', name: 'mode', value: 'pass' }),
           h('span', null, h('strong', null, 'Pass this phone around'),
@@ -370,27 +450,22 @@ function viewSetup() {
 
 function resumeHost() {
   if (host.phase === 'reveal') { viewReveal(); return; }
-  if (host.mode === 'phones') { startHostPeer(); viewHostLobby(); }
+  if (host.mode === 'phones') { viewHostLobby(); hostRetries = 0; hostSync(); }
   else viewPass();
   keepAwake();
 }
 
-function statusLine(extra) {
-  const label = { live: 'Ready for votes', connecting: 'Connecting…', down: 'Offline' }[hostStatus];
+function statusLine() {
+  const label = hostStatusMsg || { live: 'Ready for votes', connecting: 'Connecting…', down: 'Offline' }[hostStatus];
   return h('div', { class: 'status', id: 'host-status' },
     h('span', { class: `dot ${hostStatus === 'live' ? 'live' : hostStatus === 'down' ? 'down' : ''}` }),
-    extra || label);
-}
-
-function refreshHostStatus(extra) {
-  const el = $('#host-status');
-  if (el) el.replaceWith(statusLine(extra));
+    h('span', null, label));
 }
 
 let showTally = false;
 
 function ballotsSummary() {
-  const list = Object.values(host.ballots).sort((a, b) => a.at - b.at);
+  const list = Object.values(host.ballots).sort((a, b) => a.time - b.time);
   return h('div', { class: 'panel stack', id: 'host-count' },
     h('div', { class: 'center' },
       h('div', { class: 'count-big' }, list.length),
@@ -433,13 +508,13 @@ function hostControls() {
   return h('div', { class: 'stack' },
     h('button', { class: 'btn gold', onclick: closeVoting }, 'Close voting and reveal winners'),
     h('div', { class: 'btn-row' },
-      h('button', { class: 'btn ghost', onclick: () => { stopHostPeer(); viewHome(); } }, 'Home'),
+      h('button', { class: 'btn ghost', onclick: () => { stopHostSync(); viewHome(); } }, 'Home'),
       h('button', { class: 'btn ghost', onclick: endParty }, 'End party')));
 }
 
 function viewHostLobby() {
   const url = joinUrl(host.code);
-  const copy = async () => {
+  const share = async () => {
     try {
       if (navigator.share) await navigator.share({ title: host.party.name, text: `Vote in the ${host.party.name} awards`, url });
       else { await navigator.clipboard.writeText(url); toast('Link copied'); }
@@ -454,45 +529,64 @@ function viewHostLobby() {
         qrSvg(url),
         h('div', { class: 'room-code', 'aria-label': `Party code ${host.code.split('').join(' ')}` }, host.code),
         statusLine(),
-        h('button', { class: 'btn ghost', onclick: copy }, 'Share the voting link')),
+        h('button', { class: 'btn ghost', onclick: share }, 'Share the voting link')),
       ballotsSummary(),
       h('button', { class: 'btn', onclick: () => viewBallot({
         title: 'Your vote',
         party: host.party,
-        name: host.ballots['host'] ? host.ballots['host'].name : 'Host',
-        votes: host.ballots['host'] ? host.ballots['host'].votes : {},
+        name: host.ballots.host ? host.ballots.host.name : 'Host',
+        votes: host.ballots.host ? host.ballots.host.votes : {},
         onCancel: viewHostLobby,
         onSubmit: (name, votes) => { recordBallot('host', name, votes); toast('Your vote is in'); viewHostLobby(); },
-      }) }, host.ballots['host'] ? 'Change your own vote' : 'Cast your own vote'),
-      h('p', { class: 'muted small center' }, 'Keep this screen open. Guests’ votes come in through it.'),
+      }) }, host.ballots.host ? 'Change your own vote' : 'Cast your own vote'),
+      h('p', { class: 'muted small center' }, 'Votes are saved even if this screen locks. Open the app again to catch up.'),
       hostControls(),
     ),
   );
 }
 
-function closeVoting() {
-  if (!Object.keys(host.ballots).length) { toast('No votes yet'); return; }
+async function closeVoting(e) {
+  if (!Object.keys(host.ballots).length && host.mode === 'pass') { toast('No votes yet'); return; }
   if (!confirm('Close voting? Guests won’t be able to vote or change their votes.')) return;
+  const btn = e && e.currentTarget;
   host.open = false;
+  host.closedAt = nowSec();
+  if (host.mode === 'phones') {
+    if (btn) { btn.disabled = true; btn.textContent = 'Collecting the last votes…'; }
+    try {
+      // The relay's own timestamp is the cut-off, so phone clock drift can't drop late votes.
+      const posted = await relayPost(host.code, { t: 'status', open: false });
+      if (posted && posted.time) host.closedAt = Number(posted.time);
+      const missed = await relayPoll(host.code, host.lastId || 'all');
+      missed.forEach(handleHostMessage);
+    } catch (err) {
+      toast(`Couldn’t tell guests voting closed. ${err.message}`);
+    }
+    stopHostSync();
+  }
   host.phase = 'reveal';
   host.reveal = { index: 0, opened: false };
   saveHost();
-  broadcast({ t: 'closed' });
   viewReveal();
 }
 
-function reopenVoting() {
+async function reopenVoting() {
   host.open = true;
+  host.closedAt = null;
   host.phase = 'voting';
   saveHost();
-  broadcast(partyPayload(null));
+  if (host.mode === 'phones') {
+    try { await publishParty(); } catch (err) { toast(`Couldn’t reopen for guests. ${err.message}`); }
+  }
   resumeHost();
 }
 
-function endParty() {
+async function endParty() {
   if (!confirm('End the party and delete all votes? This can’t be undone.')) return;
-  broadcast({ t: 'closed' });
-  stopHostPeer();
+  if (host.mode === 'phones') {
+    try { await relayPost(host.code, { t: 'status', open: false, ended: true }); } catch { /* best effort */ }
+  }
+  stopHostSync();
   store.del(HOST_KEY);
   host = null;
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
@@ -515,7 +609,6 @@ function viewPass(lastName) {
       h('button', { class: 'btn', onclick: () => viewBallot({
         title: 'Your vote',
         party: host.party,
-        askName: true,
         onCancel: () => viewPass(),
         onSubmit: (name, votes) => {
           const id = 'local-' + name.toLowerCase();
@@ -531,18 +624,19 @@ function viewPass(lastName) {
 
 /* ---------- views: ballot (shared by guest, host and pass mode) ---------- */
 
-function viewBallot({ title, party, name = '', votes = {}, askName = true, onSubmit, onCancel, note }) {
+function viewBallot({ title, party, name = '', votes = {}, onSubmit, onCancel }) {
+  const err = h('p', { class: 'error', role: 'alert', id: 'ballot-error' });
   let nameIn;
-  const err = h('p', { class: 'error', role: 'alert' });
   const submit = (e) => {
     e.preventDefault();
+    err.textContent = '';
     const fd = new FormData(e.target);
     const picked = {};
     for (const c of party.categories) { const v = fd.get(c.id); if (v) picked[c.id] = v; }
-    const who = askName ? clean(nameIn.value, 32) : name;
-    if (askName && !who) { err.textContent = 'Add your name so the host knows you voted.'; nameIn.focus(); return; }
+    const who = clean(nameIn.value, 32);
+    if (!who) { err.textContent = 'Add your name so the host knows you voted.'; nameIn.focus(); return; }
     if (!Object.keys(picked).length) { err.textContent = 'Pick a nominee for at least one award.'; return; }
-    onSubmit(who, picked, e.submitter);
+    onSubmit(who, picked, e.submitter, err);
   };
 
   render(
@@ -550,10 +644,10 @@ function viewBallot({ title, party, name = '', votes = {}, askName = true, onSub
       h('div', { class: 'stack' },
         onCancel ? h('button', { type: 'button', class: 'btn link', onclick: onCancel }, 'Back') : null,
         h('h2', null, title),
-        h('p', { class: 'muted' }, note || 'Your picks stay secret until the host opens the envelopes.')),
-      askName ? h('label', { class: 'field' },
+        h('p', { class: 'muted' }, 'Your picks stay secret until the host opens the envelopes.')),
+      h('label', { class: 'field' },
         h('span', null, 'Your name'),
-        nameIn = h('input', { type: 'text', maxlength: '32', value: name, autocomplete: 'given-name' })) : null,
+        nameIn = h('input', { type: 'text', maxlength: '32', value: name, autocomplete: 'given-name' })),
       party.categories.map((c) =>
         h('fieldset', { class: 'ballot-cat panel' },
           h('legend', null, h('h3', null, c.title)),
@@ -566,7 +660,7 @@ function viewBallot({ title, party, name = '', votes = {}, askName = true, onSub
       h('button', { class: 'btn gold', type: 'submit' }, 'Send my vote'),
     ),
   );
-  if (askName && !name) nameIn.focus();
+  if (!name) nameIn.focus();
 }
 
 /* ---------- views: reveal ---------- */
@@ -584,7 +678,10 @@ function viewReveal() {
     index > 0 || opened ? h('button', { class: 'btn link', onclick: () => go(0, false) }, 'Start reveal over') : null);
 
   if (!results.length) {
-    render(h('div', { class: 'reveal' }, h('h2', null, 'No votes to reveal'), back));
+    render(h('div', { class: 'reveal' },
+      h('h2', null, 'No votes to reveal'),
+      h('p', { class: 'muted' }, 'Reopen voting so guests can send their picks.'),
+      back));
     return;
   }
 
@@ -648,95 +745,58 @@ function viewGuestMessage(title, body, actions) {
     actions || null));
 }
 
-function startGuest(code) {
-  if (guest && guest.peer) { try { guest.peer.destroy(); } catch { /* ignore */ } }
-  guest = { code, peer: null, conn: null, party: null, open: true, mine: store.get(BALLOT_KEY + code), retries: 0, sending: false };
-  viewGuestMessage('Finding the party…', `Party code ${code}`);
-  if (typeof Peer === 'undefined') {
-    viewGuestMessage('Can’t connect', 'The connection library didn’t load. Check your internet and reload the page.',
-      h('button', { class: 'btn', onclick: () => location.reload() }, 'Reload'));
-    return;
-  }
-  guestConnect();
+function leaveGuest() {
+  guest = null;
+  history.replaceState(null, '', location.pathname);
+  viewHome();
 }
 
-function guestConnect() {
-  const g = guest;
-  if (!g.peer || g.peer.destroyed) {
-    g.peer = new Peer();
-    g.peer.on('open', () => openConn(g));
-    g.peer.on('error', (err) => {
-      if (guest !== g) return;
-      if (err.type === 'peer-unavailable') {
-        viewGuestMessage('Party not found',
-          `No open party with code ${g.code}. Check the code on the host’s screen, and make sure their screen is still open.`,
-          h('div', { class: 'stack' },
-            h('button', { class: 'btn', onclick: () => startGuest(g.code) }, 'Try again'),
-            h('button', { class: 'btn ghost', onclick: () => { history.replaceState(null, '', location.pathname); viewHome(); } }, 'Enter a different code')));
-      } else {
-        retryGuest(g);
-      }
-    });
-  } else if (g.peer.open) {
-    openConn(g);
-  }
-}
-
-function openConn(g) {
-  const conn = g.peer.connect(PEER_PREFIX + g.code.toLowerCase(), { reliable: true });
-  g.conn = conn;
-  const timeout = setTimeout(() => { if (!conn.open) retryGuest(g); }, 12000);
-  conn.on('open', () => {
-    clearTimeout(timeout);
-    g.retries = 0;
-    conn.send({ t: 'hello', voterId: voterId() });
-  });
-  conn.on('data', (msg) => onGuestData(g, msg));
-  conn.on('close', () => { if (guest === g && g.open) retryGuest(g); });
-}
-
-function retryGuest(g) {
-  if (guest !== g) return;
-  g.retries++;
-  if (g.retries > 4) {
-    viewGuestMessage('Lost the party', 'Can’t reach the host’s screen. Ask the host to keep the app open, then try again.',
-      h('button', { class: 'btn', onclick: () => startGuest(g.code) }, 'Try again'));
-    return;
-  }
-  setTimeout(() => {
-    if (guest !== g) return;
-    if (g.peer && g.peer.disconnected && !g.peer.destroyed) g.peer.reconnect();
-    if (g.peer && g.peer.open) openConn(g);
-    else guestConnect();
-  }, 1500 * g.retries);
-}
-
-function onGuestData(g, msg) {
-  if (guest !== g || !msg || typeof msg !== 'object') return;
-  if (msg.t === 'party') {
-    const first = !g.party;
-    g.party = sanitizeParty(msg.party);
-    g.open = !!msg.open;
-    if (msg.mine) g.mine = msg.mine;
-    if (!g.open) { guestClosed(); return; }
-    // Only redraw when arriving or coming back from "closed", so a reconnect
-    // never wipes picks the guest is in the middle of making.
-    if (first || g.wasClosed) {
-      g.wasClosed = false;
-      if (g.mine) viewGuestDone(); else viewGuestBallot();
+// Latest party details and open/closed state from the relay's history.
+function partyState(msgs) {
+  let party = null, open = true, ended = false;
+  for (const m of msgs) {
+    if (m.data.t === 'party' && m.data.party) {
+      party = sanitizeParty(m.data.party);
+      open = m.data.open !== false;
+      ended = false;
+    } else if (m.data.t === 'status') {
+      open = !!m.data.open;
+      ended = !!m.data.ended;
     }
-  } else if (msg.t === 'ack') {
-    g.sending = false;
-    store.set(BALLOT_KEY + g.code, g.mine);
-    viewGuestDone(true);
-  } else if (msg.t === 'reject') {
-    g.sending = false;
-    toast(msg.reason || 'Vote not accepted');
-    viewGuestBallot();
-  } else if (msg.t === 'closed') {
-    g.open = false;
-    guestClosed();
   }
+  return { party, open, ended };
+}
+
+async function startGuest(code) {
+  const g = { code, party: null, mine: store.get(BALLOT_KEY + code) };
+  guest = g;
+  viewGuestMessage('Finding the party…', `Party code ${code}`);
+  let state;
+  try {
+    state = partyState(await relayPoll(code, 'all', () => {
+      if (guest === g) viewGuestMessage('Finding the party…', 'Lots of guests are joining at once. Hang tight — this can take a minute or two.');
+    }));
+  } catch (err) {
+    if (guest !== g) return;
+    viewGuestMessage('Can’t reach the party', err.message,
+      h('div', { class: 'stack' },
+        h('button', { class: 'btn', onclick: () => startGuest(code) }, 'Try again'),
+        h('button', { class: 'btn ghost', onclick: leaveGuest }, 'Enter a different code')));
+    return;
+  }
+  if (guest !== g) return;
+  if (!state.party) {
+    viewGuestMessage('Party not found',
+      `No party with code ${code}. Check the code on the host’s screen and try again.`,
+      h('div', { class: 'stack' },
+        h('button', { class: 'btn', onclick: () => startGuest(code) }, 'Try again'),
+        h('button', { class: 'btn ghost', onclick: leaveGuest }, 'Enter a different code')));
+    return;
+  }
+  g.party = state.party;
+  if (state.ended) { viewGuestMessage('This party has ended', 'Thanks for voting!'); return; }
+  if (!state.open) { viewGuestMessage('Voting is closed', 'All eyes on the host. The envelopes are opening.'); return; }
+  if (g.mine) viewGuestDone(false); else viewGuestBallot();
 }
 
 function viewGuestBallot() {
@@ -746,12 +806,22 @@ function viewGuestBallot() {
     party: g.party,
     name: g.mine ? g.mine.name : '',
     votes: g.mine ? g.mine.votes : {},
-    onSubmit: (name, votes, btn) => {
-      if (!g.conn || !g.conn.open) { toast('Reconnecting… try again in a moment'); retryGuest(g); return; }
-      g.mine = { name, votes };
-      g.sending = true;
+    onSubmit: async (name, votes, btn, err) => {
       if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
-      g.conn.send({ t: 'ballot', voterId: voterId(), name, votes });
+      try {
+        await relayPost(g.code, { t: 'ballot', voter: voterId(), name, votes }, () => {
+          if (btn) btn.textContent = 'Lots of people voting — still sending…';
+        });
+      } catch (error) {
+        if (guest !== g) return;
+        err.textContent = `Your vote wasn’t sent. ${error.message}`;
+        if (btn) { btn.disabled = false; btn.textContent = 'Send my vote'; }
+        return;
+      }
+      if (guest !== g) return;
+      g.mine = { name, votes };
+      store.set(BALLOT_KEY + g.code, g.mine);
+      viewGuestDone(true);
     },
   });
 }
@@ -759,13 +829,24 @@ function viewGuestBallot() {
 function viewGuestDone(justSent) {
   viewGuestMessage(justSent ? 'Vote sent!' : 'You’ve voted',
     'Watch the host’s screen for the winners. You can change your picks until voting closes.',
-    h('button', { class: 'btn ghost', onclick: viewGuestBallot }, 'Change my vote'));
+    h('button', { class: 'btn ghost', onclick: () => startGuestEdit() }, 'Change my vote'));
   if (justSent) startPetals(1800);
 }
 
-function guestClosed() {
-  guest.wasClosed = true;
-  viewGuestMessage('Voting is closed', 'All eyes on the host. The envelopes are opening.');
+// Re-check the party before editing, in case the host closed voting.
+async function startGuestEdit() {
+  const g = guest;
+  try {
+    const state = partyState(await relayPoll(g.code, 'all'));
+    if (guest !== g) return;
+    if (state.ended) { viewGuestMessage('This party has ended', 'Thanks for voting!'); return; }
+    if (!state.open) { viewGuestMessage('Voting is closed', 'All eyes on the host. The envelopes are opening.'); return; }
+    if (state.party) g.party = state.party;
+  } catch (err) {
+    toast(err.message);
+    return;
+  }
+  viewGuestBallot();
 }
 
 /* ---------- marigold petal shower ---------- */
@@ -824,6 +905,7 @@ function stopPetals() {
 /* ---------- boot ---------- */
 
 (function boot() {
+  store.del('bwv-host-v1');   // state from the old peer-to-peer version
   const room = new URLSearchParams(location.search).get('room');
   if (room && /^[A-Za-z0-9]{5}$/.test(room)) { startGuest(room.toUpperCase()); return; }
   viewHome();

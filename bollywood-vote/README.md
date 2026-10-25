@@ -14,15 +14,17 @@ No Wi-Fi at the venue, or guests without phones? Choose **Pass this phone around
 
 ## How it works
 
-Plain HTML, CSS and JavaScript — no build step, no backend of its own, so it runs on GitHub Pages like the snake game.
+Plain HTML, CSS and JavaScript — no build step and no backend of its own, so it runs on GitHub Pages like the snake game.
 
-- Guest phones connect **directly to the host's browser** over WebRTC, using the free public [PeerJS](https://peerjs.com/) broker only to find each other. The host's device holds the votes, so **the host must keep the app open** during voting.
-- Votes are saved in the host's browser, so a refresh or accidental close doesn't lose them.
-- Strict networks (some corporate Wi-Fi, a few mobile carriers) can block peer-to-peer connections. If a guest can't connect, use pass-the-phone mode or switch them to the same Wi-Fi as the host.
+- Votes travel through [ntfy.sh](https://ntfy.sh), a free public relay that needs no account. Each party uses its own topic named after the party code; guests post their ballot there and the host's screen reads it back.
+- The relay keeps messages for 12 hours, so **votes aren't lost if the host's phone locks or drops signal** — the host's screen catches up as soon as the app is open again. Ballots sent after voting closes are ignored.
+- If a guest's vote can't be sent (no signal), they see an error and can try again. If lots of guests on the same Wi-Fi vote in the same minute, the app waits and retries automatically.
+- The host's results are also saved in their browser, so a refresh doesn't lose them.
+- Party topics aren't password-protected: anyone who knows the code could read the raw votes. Fine for a party game; don't use it for anything secret.
 
 ```
 bollywood-vote/
-├── index.html   # page shell, fonts, CDN scripts (PeerJS, QR code)
+├── index.html   # page shell, fonts, QR code library
 ├── style.css    # marigold-and-plum theme
 └── app.js       # host, guest, pass-the-phone and reveal flows
 ```
