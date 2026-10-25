@@ -10,6 +10,8 @@ A tiny, dependency-free Snake game inspired by the classic Nokia 3310, built to 
 
 Open that link on desktop or mobile. On your phone, use "Add to Home Screen" (see below) to install it like a native app.
 
+> **Also in this repo:** [🌼 Bollywood Night Awards](https://sheery96.github.io/claude-ai-games/bollywood-vote/) — a party voting app. See [`bollywood-vote/`](bollywood-vote/README.md).
+
 ## Why it's lightweight
 
 Instead of Flutter/React Native/native builds, this is plain **HTML + CSS + JavaScript** packaged as a **Progressive Web App (PWA)**:
